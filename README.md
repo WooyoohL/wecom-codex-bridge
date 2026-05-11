@@ -6,21 +6,29 @@
 
 部署完成后，可以直接在企业微信里和本机 Codex 对话：
 
-![企业微信对话效果](source/chat_01.png)
+<p align="center">
+  <img src="source/chat_01.png" alt="企业微信对话效果" width="360">
+</p>
 
 ## 架构示意
 
 整体链路：
 
-![整体架构](source/architecture.png)
+<p align="center">
+  <img src="source/architecture.png" alt="整体架构" width="760">
+</p>
 
 多台电脑独立部署时，可以在同一台 VPS 上用不同 callback path 和端口分流：
 
-![多实例分流](source/multi-instance-routing.png)
+<p align="center">
+  <img src="source/multi-instance-routing.png" alt="多实例分流" width="760">
+</p>
 
 启动脚本会读取本地配置，同时拉起 bridge 和 SSH 反向隧道：
 
-![启动流程](source/startup-flow.png)
+<p align="center">
+  <img src="source/startup-flow.png" alt="启动流程" width="760">
+</p>
 
 ## 工作流程
 
