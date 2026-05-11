@@ -2,7 +2,7 @@
 
 把企业微信自建应用接到你本机的 Codex remote-control。配置完成后，你可以在手机企业微信里给 Codex 发消息，Codex 在你的电脑上继续同一个 thread 工作，再把结果发回手机。
 
-## 你会得到什么
+## 工作流程
 
 ```text
 手机企业微信
@@ -34,26 +34,7 @@ Codex app-server 只在你的电脑上启动，不直接暴露到公网。
 - 只支持企业微信文本消息。
 - 还没有完整的手机端审批 UI。如果启用 `on-request` 审批，Codex 可能等待你回到电脑端处理。
 - `/status`、`/resume` 等是通过 Codex remote-control 近似适配，不是直接执行 Codex TUI 原版 slash UI。
-- 默认配置是给“自己远程控制自己电脑”用的，权限很高。发布给别人使用时，请认真阅读“安全配置”。
 
-## 文件结构
-
-```text
-wecom_bridge.py              启动入口
-wecom_bridge/                Python 主服务包
-wecom_bridge/config.py       读取 config.local.env
-wecom_bridge/http_server.py  企业微信回调和 /health
-wecom_bridge/worker.py       消息分发、命令、菜单、active turn
-wecom_bridge/wecom/          企业微信验签、解密、发消息
-wecom_bridge/codex/          Codex app-server client、slash、格式化、thread 服务
-
-config.example.env           配置模板，复制为 config.local.env 后填写
-requirements.txt             Python 依赖
-nginx/wecom-callback.conf    VPS Nginx 示例配置
-scripts/start.sh             一键启动 bridge 和 SSH 反向隧道，Ctrl+C 自动停止
-```
-
-运行时会产生 `logs/`、`.codex_wecom_thread_id`、`.codex_wecom_model`、`.codex_wecom_reasoning`、`.codex_wecom_workdir`、`__pycache__/` 等文件；这些都应该被 `.gitignore` 忽略。
 
 ## 前置条件
 
@@ -61,9 +42,9 @@ scripts/start.sh             一键启动 bridge 和 SSH 反向隧道，Ctrl+C �
 
 ```text
 1. 一台能运行 Codex 的本机电脑
-2. 本机已安装并能正常使用 codex 命令
+2. 本机已安装codex，登录并能正常使用 codex 命令
 3. Python 3.10 或更新版本
-4. 一个企业微信自建应用
+4. 一个企业微信自建应用（容易实现，请自行在企业微信注册）
 5. 一台有公网 IP 的 VPS
 6. VPS 上安装 Nginx
 7. 本机能 SSH 登录 VPS
@@ -102,7 +83,7 @@ cp config.example.env config.local.env
 
 ## 第二步：填写企业微信配置
 
-在企业微信管理后台创建自建应用后，填写这些字段：
+在企业微信管理后台创建自建应用后，找到以下字段并在config中填写：
 
 ```text
 WECOM_CORP_ID=企业ID
@@ -115,7 +96,7 @@ WECOM_TO_USER=你的企业微信UserID
 
 ```text
 URL: http://你的VPS公网IP/wecom/callback
-Token: 自己生成一个字符串，并填到 WECOM_TOKEN
+Token: 点击企业微信页面中的按钮生成一个字符串，并填到 WECOM_TOKEN
 EncodingAESKey: 企业微信页面生成的 43 位 EncodingAESKey，填到 WECOM_ENCODING_AES_KEY
 ```
 
@@ -196,7 +177,7 @@ CODEX_REMOTE_SANDBOX=workspace-write
 workspace-write 允许 Codex 在工作区写文件，但敏感动作仍可能请求审批
 ```
 
-注意：当前 bridge 还没有完整手机端审批流程。启用 `on-request` 后，Codex 可能会等待审批；这时你需要回到电脑端处理，或者后续自行扩展企业微信审批适配。
+注意：当前 bridge 并未实现完整手机端审批流程。启用 `on-request` 后，Codex 可能会等待审批；这时你需要回到电脑端处理，或者后续自行扩展企业微信审批适配。
 
 ## 第五步：配置 VPS Nginx
 
@@ -445,8 +426,6 @@ active_turn=(none)
 再发送新任务。
 
 ## 输出规则
-
-普通文本新开 turn 时，bridge 不会额外推送 `Codex started` 调试消息。你可以用 `!status` 查看 thread id 和 turn id。
 
 长任务期间会推送精简过程：
 
