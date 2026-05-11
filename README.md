@@ -474,21 +474,3 @@ active_turn=(none)
 
 新版 bridge 会同步 `turn/steer` 返回的最新 turn id，并在 interrupt mismatch 时自动重试。遇到这个问题请先更新到最新版并重启 `scripts/start.sh`。
 
-## 发布前检查
-
-发布前建议执行：
-
-```bash
-python3 -m py_compile wecom_bridge.py wecom_bridge/*.py wecom_bridge/codex/*.py wecom_bridge/wecom/*.py
-bash -n scripts/start.sh
-find . -type d -name __pycache__ -prune -exec rm -rf {} +
-```
-
-确认不要提交：
-
-```text
-config.local.env
-logs/
-__pycache__/
-.codex_wecom_*
-```
