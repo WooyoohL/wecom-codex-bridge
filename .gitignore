@@ -1,0 +1,10 @@
+config.local.env
+logs/
+.run/
+__pycache__/
+*.py[cod]
+.codex_wecom_thread_id
+.codex_wecom_model
+.codex_wecom_reasoning
+.codex_wecom_workdir
+.DS_Store
