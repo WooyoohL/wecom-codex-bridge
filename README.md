@@ -2,6 +2,26 @@
 
 把企业微信自建应用接到你本机的 Codex remote-control。配置完成后，你可以在手机企业微信里给 Codex 发消息，Codex 在你的电脑上继续同一个 thread 工作，再把结果发回手机。
 
+## 效果预览
+
+部署完成后，可以直接在企业微信里和本机 Codex 对话：
+
+![企业微信对话效果](source/chat_01.png)
+
+## 架构示意
+
+整体链路：
+
+![整体架构](source/architecture.png)
+
+多台电脑独立部署时，可以在同一台 VPS 上用不同 callback path 和端口分流：
+
+![多实例分流](source/multi-instance-routing.png)
+
+启动脚本会读取本地配置，同时拉起 bridge 和 SSH 反向隧道：
+
+![启动流程](source/startup-flow.png)
+
 ## 工作流程
 
 ```text
@@ -252,7 +272,13 @@ SSH_PROXY_URL=
 在本机运行：
 
 ```bash
-bash scripts/start.sh config.local.env
+bash scripts/start.sh
+```
+
+脚本默认读取仓库根目录的 `config.local.env`。如果需要使用其他配置文件，可以显式传入路径：
+
+```bash
+bash scripts/start.sh path/to/your.env
 ```
 
 脚本会启动两件事：
@@ -473,4 +499,3 @@ active_turn=(none)
 ### `!stop` 报 active turn id 不一致
 
 新版 bridge 会同步 `turn/steer` 返回的最新 turn id，并在 interrupt mismatch 时自动重试。遇到这个问题请先更新到最新版并重启 `scripts/start.sh`。
-
