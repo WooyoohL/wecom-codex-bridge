@@ -16,6 +16,7 @@ from wecom_bridge.codex.formatters import (
     format_plan_update,
     format_status_value,
     format_timestamp,
+    tail_text,
 )
 
 
@@ -530,17 +531,24 @@ class CodexAppServerClient:
                 if message and on_message:
                     on_message(f"[警告]\n{message}")
             elif method == "item/started":
-                text = format_item_progress(params.get("item") or {}, sent_progress_item_ids)
+                item = params.get("item") or {}
+                text = None
+                if self._bridge_option("bridge_forward_tool_progress", False):
+                    text = format_item_progress(item, sent_progress_item_ids)
                 if text and on_message:
                     on_message(text)
             elif method == "item/completed":
                 item = params.get("item") or {}
-                text = format_item_progress(item, sent_progress_item_ids)
+                text = self._format_completed_progress(item, sent_progress_item_ids)
                 if text and on_message:
                     on_message(text)
                 if item.get("type") == "agentMessage" and item.get("text"):
                     text = item["text"]
-                    if item.get("phase") != "commentary":
+                    if item.get("phase") == "commentary":
+                        summary = self._format_thought_summary(text)
+                        if summary and on_message:
+                            on_message(summary)
+                    else:
                         completed_text = text
             elif method == "error":
                 error = params.get("error") or {}
@@ -554,11 +562,48 @@ class CodexAppServerClient:
                 if turn.get("status") == "failed":
                     self._clear_current_turn_id(thread_id, current_turn_id)
                     return f"Codex turn failed: {turn.get('error')}"
-                diff_summary = format_diff_summary(latest_diff)
+                diff_summary = (
+                    format_diff_summary(latest_diff)
+                    if self._bridge_option("bridge_forward_file_changes", False)
+                    else None
+                )
                 if diff_summary and on_message:
                     on_message(diff_summary)
                 self._clear_current_turn_id(thread_id, current_turn_id)
                 return completed_text or "".join(chunks).strip() or "(Codex completed with no output)"
+
+    def _format_completed_progress(
+        self,
+        item: dict[str, Any],
+        sent_progress_item_ids: set[str],
+    ) -> str | None:
+        item_type = item.get("type")
+        if item_type == "fileChange" and not self._bridge_option("bridge_forward_file_changes", False):
+            return None
+        if self._bridge_option("bridge_forward_tool_progress", False):
+            return format_item_progress(item, sent_progress_item_ids)
+        if item_type == "commandExecution":
+            status = item.get("status")
+            exit_code = item.get("exitCode")
+            if status in ("failed", "error") or (exit_code not in (None, 0)):
+                return format_item_progress(item, sent_progress_item_ids)
+        if item_type in ("mcpToolCall", "dynamicToolCall") and item.get("status") == "failed":
+            return format_item_progress(item, sent_progress_item_ids)
+        return None
+
+    def _format_thought_summary(self, text: str) -> str | None:
+        if not self._bridge_option("bridge_forward_thought_summary", True):
+            return None
+        stripped = text.strip()
+        if not stripped:
+            return None
+        return "[思考摘要]\n" + tail_text(stripped, 1200)
+
+    def _bridge_option(self, name: str, default: bool) -> bool:
+        config = getattr(self, "config", None)
+        if config is None:
+            return default
+        return bool(getattr(config, name, default))
 
     def _notification_turn_id(self, params: dict[str, Any]) -> str | None:
         turn_id = params.get("turnId")

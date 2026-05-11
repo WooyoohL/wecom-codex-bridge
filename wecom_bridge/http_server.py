@@ -2,6 +2,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler
 
+from wecom_bridge.audit import audit_event
 from wecom_bridge.config import Config
 from wecom_bridge.models import IncomingMessage, format_active_turn_status
 from wecom_bridge.wecom.crypto import WeComCrypto
@@ -41,6 +42,10 @@ class Handler(BaseHTTPRequestHandler):
                 "ok\n"
                 f"backend={self.state.config.codex_backend}\n"
                 f"command_prefix={self.state.config.bridge_command_prefix}\n"
+                f"security_profile={self.state.config.bridge_security_profile}\n"
+                f"allowed_users={len(self.state.config.allowed_wecom_users)}\n"
+                "confirmation_required="
+                f"{self.state.config.dangerous_commands_require_confirmation}\n"
                 f"queue_size={worker.queue.qsize()}\n"
                 f"recent_outgoing={len(worker.recent_outgoing)}\n"
                 f"model_override={model_override}\n"
@@ -89,10 +94,32 @@ class Handler(BaseHTTPRequestHandler):
                 content=message.get("Content", ""),
                 msg_id=message.get("MsgId", ""),
             )
+            if not self.state.config.is_user_allowed(incoming.from_user):
+                audit_event(
+                    self.state.config,
+                    "unauthorized_message",
+                    user=incoming.from_user,
+                    msg_type=incoming.msg_type,
+                    msg_id=incoming.msg_id,
+                )
+                print(
+                    f"skip unauthorized wecom message: from={incoming.from_user} "
+                    f"type={incoming.msg_type} msg_id={incoming.msg_id}",
+                    flush=True,
+                )
+                self.respond_text(200, "success")
+                return
             print(
                 f"received wecom message: from={incoming.from_user} "
                 f"type={incoming.msg_type} msg_id={incoming.msg_id}",
                 flush=True,
+            )
+            audit_event(
+                self.state.config,
+                "message_received",
+                user=incoming.from_user,
+                msg_type=incoming.msg_type,
+                msg_id=incoming.msg_id,
             )
             self.state.worker.submit(incoming)
             self.respond_text(200, "success")

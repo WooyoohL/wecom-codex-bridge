@@ -6,6 +6,7 @@ import time
 from dataclasses import replace
 from typing import Callable
 
+from wecom_bridge.audit import audit_event
 from wecom_bridge.codex.client import CodexAppServerClient
 from wecom_bridge.codex.formatters import tail_text
 from wecom_bridge.codex.slash import CodexSlashCommandProvider
@@ -15,11 +16,24 @@ from wecom_bridge.models import (
     ActiveTurn,
     IncomingMessage,
     MenuOption,
+    PendingConfirmation,
     PendingMenu,
     RecentOutgoing,
     format_active_turn_status,
 )
 from wecom_bridge.wecom.sender import WeComSender
+
+
+DANGEROUS_BRIDGE_COMMANDS = {
+    "archive",
+    "bind",
+    "cd",
+    "fork",
+    "new",
+    "rename",
+    "rollback",
+    "unarchive",
+}
 
 
 class MessageWorker:
@@ -34,6 +48,7 @@ class MessageWorker:
         self._pending_lock = threading.Lock()
         self.recent_outgoing: list[RecentOutgoing] = []
         self.pending_menu: PendingMenu | None = None
+        self.pending_confirmation: PendingConfirmation | None = None
         self.active_turn: ActiveTurn | None = None
         self.remote_client: CodexAppServerClient | None = None
         if config.codex_backend == "codex_remote_control":
@@ -76,6 +91,13 @@ class MessageWorker:
                         reply, after_send = bridge_result
                     else:
                         reply = bridge_result
+                elif (
+                    pending_confirm := self._handle_pending_confirmation(
+                        message.content,
+                        self.config.to_user or message.from_user,
+                    )
+                ) is not None:
+                    reply = pending_confirm
                 elif (pending_reply := self._handle_pending_menu(message.content)) is not None:
                     reply = pending_reply
                 elif message.content.strip() == "/":
@@ -177,6 +199,40 @@ class MessageWorker:
                 self.pending_menu = None
                 return None
             return menu
+
+    def _set_pending_confirmation(self, confirmation: PendingConfirmation) -> None:
+        with self._pending_lock:
+            self.pending_confirmation = confirmation
+
+    def _clear_pending_confirmation(self) -> None:
+        with self._pending_lock:
+            self.pending_confirmation = None
+
+    def _pending_confirmation_snapshot(self) -> PendingConfirmation | None:
+        with self._pending_lock:
+            confirmation = self.pending_confirmation
+            if confirmation and time.time() - confirmation.created_at > 300:
+                self.pending_confirmation = None
+                return None
+            return confirmation
+
+    def _handle_pending_confirmation(self, text: str, target: str) -> str | None:
+        confirmation = self._pending_confirmation_snapshot()
+        if not confirmation:
+            return None
+        stripped = text.strip()
+        if stripped in {"确认", "同意", "yes", "y"}:
+            return self._confirm_bridge_command(confirmation.confirmation_id, target)
+        if stripped in {"取消", "拒绝", "no", "n"}:
+            self._clear_pending_confirmation()
+            audit_event(
+                self.config,
+                "bridge_command_denied",
+                user=target,
+                command=confirmation.command_line,
+            )
+            return f"cancelled: {confirmation.command_line}"
+        return None
 
     def _handle_pending_menu(self, text: str) -> str | None:
         menu = self._pending_snapshot()
@@ -349,6 +405,8 @@ class MessageWorker:
         self,
         text: str,
         target: str | None = None,
+        *,
+        confirmed: bool = False,
     ) -> str | tuple[str, Callable[[], None] | None]:
         stripped = text.strip()
         prefix = self.config.bridge_command_prefix
@@ -357,8 +415,23 @@ class MessageWorker:
             return self._bridge_help()
         command, _, arg = command_line.partition(" ")
         command = command.lower()
+        target_user = target or self.config.to_user
         if command in ("help", "h", "?"):
             return self._bridge_help()
+        if command == "confirm":
+            return self._confirm_bridge_command(arg.strip(), target_user)
+        if command == "deny":
+            return self._deny_bridge_command(arg.strip(), target_user)
+        if self.config.allowed_bridge_commands and command not in self.config.allowed_bridge_commands:
+            audit_event(
+                self.config,
+                "bridge_command_blocked",
+                user=target_user,
+                command=command,
+            )
+            return f"bridge command is not allowed: {prefix}{command}"
+        if self._requires_confirmation(command, confirmed):
+            return self._request_bridge_command_confirmation(command_line, target_user)
         if command == "status":
             extra = ""
             if self.remote_client:
@@ -375,7 +448,11 @@ class MessageWorker:
                 extra += f"\ncwd={self.remote_client.workdir}"
             return (
                 f"bridge ok\nbackend={self.config.codex_backend}"
-                f"\ncommand_prefix={prefix}{extra}"
+                f"\ncommand_prefix={prefix}"
+                f"\nsecurity_profile={self.config.bridge_security_profile}"
+                f"\nallowed_users={len(self.config.allowed_wecom_users)}"
+                f"\nconfirmation_required={self.config.dangerous_commands_require_confirmation}"
+                f"{extra}"
             )
         if command == "tail":
             limit = 10
@@ -393,7 +470,7 @@ class MessageWorker:
             return self._bridge_cd(arg)
         if command in ("continue", "cont", "resume"):
             prompt = arg.strip() or "继续"
-            return self._handle_remote_text(prompt, target or self.config.to_user)
+            return self._handle_remote_text(prompt, target_user)
         if command in ("stop", "interrupt"):
             active = self._active_snapshot()
             if not active:
@@ -462,6 +539,75 @@ class MessageWorker:
             return f"rolled back thread\nthread={thread_id}\nnum_turns={num_turns}"
         return f"unknown bridge command: {prefix}{command}\n\n{self._bridge_help()}"
 
+    def _requires_confirmation(self, command: str, confirmed: bool) -> bool:
+        return (
+            self.config.dangerous_commands_require_confirmation
+            and not confirmed
+            and command in DANGEROUS_BRIDGE_COMMANDS
+        )
+
+    def _request_bridge_command_confirmation(self, command_line: str, target: str) -> str:
+        confirmation_id = str(int(time.time()))
+        self._set_pending_confirmation(
+            PendingConfirmation(
+                confirmation_id=confirmation_id,
+                command_line=command_line,
+                user_id=target,
+                created_at=time.time(),
+            )
+        )
+        audit_event(
+            self.config,
+            "bridge_command_confirmation_requested",
+            user=target,
+            command=command_line,
+            confirmation_id=confirmation_id,
+        )
+        prefix = self.config.bridge_command_prefix
+        return (
+            "Bridge command requires confirmation\n"
+            f"id={confirmation_id}\n"
+            f"command={prefix}{command_line}\n\n"
+            f"Reply 确认 or {prefix}confirm {confirmation_id} to run it.\n"
+            f"Reply 取消 or {prefix}deny {confirmation_id} to cancel."
+        )
+
+    def _confirm_bridge_command(self, confirmation_id: str, target: str) -> str | tuple[str, Callable[[], None] | None]:
+        confirmation = self._pending_confirmation_snapshot()
+        if not confirmation:
+            return "no pending bridge command confirmation"
+        if confirmation_id and confirmation_id != confirmation.confirmation_id:
+            return f"confirmation id mismatch; expected {confirmation.confirmation_id}"
+        self._clear_pending_confirmation()
+        audit_event(
+            self.config,
+            "bridge_command_confirmed",
+            user=target,
+            command=confirmation.command_line,
+            confirmation_id=confirmation.confirmation_id,
+        )
+        return self._handle_bridge_command(
+            self.config.bridge_command_prefix + confirmation.command_line,
+            target,
+            confirmed=True,
+        )
+
+    def _deny_bridge_command(self, confirmation_id: str, target: str) -> str:
+        confirmation = self._pending_confirmation_snapshot()
+        if not confirmation:
+            return "no pending bridge command confirmation"
+        if confirmation_id and confirmation_id != confirmation.confirmation_id:
+            return f"confirmation id mismatch; expected {confirmation.confirmation_id}"
+        self._clear_pending_confirmation()
+        audit_event(
+            self.config,
+            "bridge_command_denied",
+            user=target,
+            command=confirmation.command_line,
+            confirmation_id=confirmation.confirmation_id,
+        )
+        return f"cancelled: {self.config.bridge_command_prefix}{confirmation.command_line}"
+
     def _bridge_help(self) -> str:
         prefix = self.config.bridge_command_prefix
         return (
@@ -475,6 +621,8 @@ class MessageWorker:
             f"{prefix}archive\n"
             f"{prefix}unarchive <thread_id>\n"
             f"{prefix}rollback [n]\n"
+            f"{prefix}confirm <id>\n"
+            f"{prefix}deny <id>\n"
             f"{prefix}cwd\n"
             f"{prefix}cd <path>\n"
             f"{prefix}stop\n"

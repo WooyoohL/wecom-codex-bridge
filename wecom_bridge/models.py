@@ -41,6 +41,14 @@ class PendingMenu:
     options: list[MenuOption]
 
 
+@dataclass(frozen=True)
+class PendingConfirmation:
+    confirmation_id: str
+    command_line: str
+    user_id: str
+    created_at: float
+
+
 def format_active_turn_status(active: ActiveTurn | None) -> str:
     if not active:
         return "active_turn=(none)"

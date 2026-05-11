@@ -60,7 +60,7 @@ Codex app-server 只在你的电脑上启动，不直接暴露到公网。
 ## 当前限制
 
 - 只支持企业微信文本消息。
-- 还没有完整的手机端审批 UI。如果启用 `on-request` 审批，Codex 可能等待你回到电脑端处理。
+- 支持 Codex `on-request` 审批请求转发到手机；收到 `[审批请求]` 后回复 `同意` 或 `拒绝`。
 - `/status`、`/resume` 等是通过 Codex remote-control 近似适配，不是直接执行 Codex TUI 原版 slash UI。
 
 
@@ -162,50 +162,80 @@ BRIDGE_COMMAND_PREFIX=!
 
 ## 第四步：安全配置
 
-默认配置：
+默认安全配置：
 
 ```text
-CODEX_REMOTE_APPROVAL_POLICY=never
-CODEX_REMOTE_SANDBOX=danger-full-access
-```
-
-含义：
-
-```text
-never               不让 Codex 再请求审批
-danger-full-access 允许 Codex 在本机完整访问文件和执行命令
-```
-
-这适合你自己控制自己的可信电脑，但风险很高。别人拿到你的企业微信应用权限后，就可能远程让 Codex 在你的机器上执行任务。
-
-更保守的只读配置：
-
-```text
-CODEX_REMOTE_APPROVAL_POLICY=on-request
-CODEX_REMOTE_SANDBOX=read-only
-```
-
-含义：
-
-```text
-on-request  Codex 需要执行命令或改文件时请求审批
-read-only   Codex 只能读取文件，不能直接写文件
-```
-
-中间模式：
-
-```text
+BRIDGE_SECURITY_PROFILE=dev
 CODEX_REMOTE_APPROVAL_POLICY=on-request
 CODEX_REMOTE_SANDBOX=workspace-write
+ALLOWED_WECOM_USERS=<WECOM_TO_USER>
+DANGEROUS_COMMANDS_REQUIRE_CONFIRMATION=true
 ```
 
-含义：
+`BRIDGE_SECURITY_PROFILE` 有三档：
 
 ```text
-workspace-write 允许 Codex 在工作区写文件，但敏感动作仍可能请求审批
+safe      read-only + on-request
+dev       workspace-write + on-request
+personal  danger-full-access + never
 ```
 
-注意：当前 bridge 并未实现完整手机端审批流程。启用 `on-request` 后，Codex 可能会等待审批；这时你需要回到电脑端处理，或者后续自行扩展企业微信审批适配。
+`CODEX_REMOTE_APPROVAL_POLICY` 和 `CODEX_REMOTE_SANDBOX` 留空时由 profile 决定；如果显式填写，则覆盖 profile。
+
+默认只允许 `WECOM_TO_USER` 对应的企业微信 UserID 控制 bridge。需要多用户时，设置：
+
+```text
+ALLOWED_WECOM_USERS=user_a,user_b
+```
+
+不在白名单里的企业微信消息会被忽略，并写入 `BRIDGE_AUDIT_LOG_FILE`。
+
+会改变 thread/cwd 的 bridge 命令默认需要二次确认，包括：
+
+```text
+!bind
+!new
+!fork
+!rename
+!archive
+!unarchive
+!rollback
+!cd
+```
+
+手机端会收到：
+
+```text
+Bridge command requires confirmation
+id=<id>
+command=!new
+
+Reply 确认 or !confirm <id> to run it.
+Reply 取消 or !deny <id> to cancel.
+```
+
+Codex 自身的 `on-request` 审批使用更短的手机回复。收到 `[审批请求]` 后，直接回复：
+
+```text
+同意
+```
+
+或：
+
+```text
+拒绝
+```
+
+命令执行和文件修改审批会分别回写 app-server。权限扩展审批默认只按本次 turn 授予或拒绝，避免无意扩大到整个 session。
+
+如果要恢复旧的单人宽松模式，明确设置：
+
+```text
+BRIDGE_SECURITY_PROFILE=personal
+DANGEROUS_COMMANDS_REQUIRE_CONFIRMATION=false
+```
+
+注意：如果同时出现多个待审批请求，`同意` / `拒绝` 会处理最早收到的那一个。Codex 通常会串行等待审批，因此正常情况下手机端只会看到一个待处理请求。
 
 ## 第五步：配置 VPS Nginx
 
@@ -360,6 +390,8 @@ Bridge 管理命令使用 `!` 前缀：
 !archive            归档当前 thread，并清除当前绑定
 !unarchive <id>     取消归档指定 thread，并绑定到它
 !rollback [n]       回退当前 thread 最近 n 个 turn，默认 1
+!confirm <id>       确认执行待确认的危险 bridge 命令
+!deny <id>          取消待确认的危险 bridge 命令
 !cwd                查看当前 thread cwd 和默认新 thread cwd
 !cd <path>          切换默认 cwd，并在该目录新建 thread
 !cd reset           清除 cwd 覆盖，回到 CODEX_WORKDIR 并新建 thread
@@ -398,14 +430,36 @@ Codex slash 命令使用 `/`：
 
 例如：
 
-```text
 !status 看 bridge 自己是否正常
 /status 看当前 Codex thread 的状态摘要
 ```
 
+长任务期间会推送精简过程：
+
+```text
+[计划更新]      Codex plan 更新
+[思考摘要]      Codex reasoning summary / commentary 中明确可展示的计划、取舍、下一步说明
+[审批请求]      Codex 请求执行命令、修改文件或临时扩展权限
+[直接执行失败]  失败命令摘要、退出码和尾部输出
+[警告]          Codex 警告
+```
+
+`[思考摘要]` 不是隐藏推理链；它来自 app-server 明确输出的 reasoning summary / commentary。
+
+默认不转发命令开始、工具调用和文件修改摘要，因为手机端更需要判断 Codex “准备做什么、为什么这么做、是否卡住”，而不是看到每次执行了哪个 shell 命令。
+
+需要诊断模式时可以打开：
+
+```text
+BRIDGE_FORWARD_TOOL_PROGRESS=true
+BRIDGE_FORWARD_FILE_CHANGES=true
+```
+
+命令大输出仍不转发，除非命令失败。
+
 ## 普通文本路由逻辑
 
-手机里直接发送普通文本时，bridge 会根据当前 Codex 状态决定怎么送。
+手机里直接发送普通文本时，bridge 不会每次都新开 thread，而是根据当前 Codex 状态决定怎么送给 Codex。
 
 ### Codex 空闲
 
