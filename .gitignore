@@ -1,4 +1,9 @@
 config.local.env
+*.local.env
+.env
+.env.*
+!.env.example
+!.env.sample
 logs/
 .run/
 __pycache__/
