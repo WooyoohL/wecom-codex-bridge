@@ -139,13 +139,7 @@ WECOM_ENCODING_AES_KEY=和企业微信后台一致
 
 ## 第三步：填写 Codex 配置
 
-最重要的是工作目录：
-
-```text
-CODEX_WORKDIR=/absolute/path/to/your/project
-```
-
-这个目录就是手机发来的任务默认在哪个项目里执行。请使用绝对路径，例如：
+最重要的是工作目录。这个目录就是手机发来的任务默认在哪个项目里执行，请使用绝对路径：
 
 ```text
 CODEX_WORKDIR=/absolute/path/to/your/project
@@ -226,7 +220,7 @@ Codex 自身的 `on-request` 审批使用更短的手机回复。收到 `[审批
 拒绝
 ```
 
-命令执行和文件修改审批会分别回写 app-server。权限扩展审批默认只按本次 turn 授予或拒绝，避免无意扩大到整个 session。
+命令执行和文件修改审批会分别回写 app-server 的 `accept/decline`。权限扩展审批默认只按本次 turn 授予或拒绝，避免无意扩大到整个 session。
 
 如果要恢复旧的单人宽松模式，明确设置：
 
@@ -430,32 +424,10 @@ Codex slash 命令使用 `/`：
 
 例如：
 
+```text
 !status 看 bridge 自己是否正常
 /status 看当前 Codex thread 的状态摘要
 ```
-
-长任务期间会推送精简过程：
-
-```text
-[计划更新]      Codex plan 更新
-[思考摘要]      Codex reasoning summary / commentary 中明确可展示的计划、取舍、下一步说明
-[审批请求]      Codex 请求执行命令、修改文件或临时扩展权限
-[直接执行失败]  失败命令摘要、退出码和尾部输出
-[警告]          Codex 警告
-```
-
-`[思考摘要]` 不是隐藏推理链；它来自 app-server 明确输出的 reasoning summary / commentary。
-
-默认不转发命令开始、工具调用和文件修改摘要，因为手机端更需要判断 Codex “准备做什么、为什么这么做、是否卡住”，而不是看到每次执行了哪个 shell 命令。
-
-需要诊断模式时可以打开：
-
-```text
-BRIDGE_FORWARD_TOOL_PROGRESS=true
-BRIDGE_FORWARD_FILE_CHANGES=true
-```
-
-命令大输出仍不转发，除非命令失败。
 
 ## 普通文本路由逻辑
 
@@ -515,20 +487,26 @@ active_turn=(none)
 
 ## 输出规则
 
-长任务期间会推送精简过程：
+长任务期间默认只推送对手机端有决策价值的过程：
 
 ```text
 [计划更新]      Codex plan 更新
-[直接执行]      Codex 正在执行命令；长命令和多行脚本只显示摘要
+[思考摘要]      Codex reasoning summary / commentary 中明确可展示的计划、取舍、下一步说明
+[审批请求]      Codex 请求执行命令、修改文件或临时扩展权限
 [直接执行失败]  失败命令摘要、退出码和尾部输出
-[网络搜索]      web search query
-[工具调用]      MCP/dynamic tool 名称
-[文件修改]      patch 触及的文件
-[文件变更]      最终 diff 摘要
 [警告]          Codex 警告
 ```
 
-普通 commentary 不转发到手机，避免刷屏。命令大输出也不转发，除非命令失败。
+`[思考摘要]` 不是隐藏推理链；它来自 app-server 明确输出的 reasoning summary / commentary。
+
+默认不转发命令开始、工具调用和文件修改摘要，因为手机端更需要判断 Codex “准备做什么、为什么这么做、是否卡住”，而不是看到每次执行了哪个 shell 命令。命令大输出也不转发，除非命令失败。
+
+需要诊断模式时可以打开：
+
+```text
+BRIDGE_FORWARD_TOOL_PROGRESS=true
+BRIDGE_FORWARD_FILE_CHANGES=true
+```
 
 ## 常见问题
 

@@ -20,6 +20,15 @@ from wecom_bridge.codex.formatters import (
 )
 
 
+APPROVAL_REQUEST_METHODS = {
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "execCommandApproval",
+    "applyPatchApproval",
+}
+
+
 class CodexAppServerClient:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -346,17 +355,24 @@ class CodexAppServerClient:
         thread_id: str,
         turn_id: str,
         on_message: Callable[[str], None] | None = None,
+        on_approval: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         return self._wait_for_turn(
             thread_id,
             turn_id,
             self.config.codex_timeout_seconds,
             on_message=on_message,
+            on_approval=on_approval,
         )
 
-    def send_turn(self, text: str, on_message: Callable[[str], None] | None = None) -> str:
+    def send_turn(
+        self,
+        text: str,
+        on_message: Callable[[str], None] | None = None,
+        on_approval: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
         thread_id, turn_id = self.start_turn(text)
-        return self.wait_for_turn(thread_id, turn_id, on_message=on_message)
+        return self.wait_for_turn(thread_id, turn_id, on_message=on_message, on_approval=on_approval)
 
     def request(self, method: str, params: dict[str, Any] | None, timeout: int) -> dict[str, Any]:
         if self.process.poll() is not None:
@@ -381,6 +397,45 @@ class CodexAppServerClient:
             error = response["error"]
             raise RuntimeError(f"{method} failed: {error.get('message', error)}")
         return response.get("result", {})
+
+    def respond_to_approval_request(
+        self,
+        request_id: str | int,
+        method: str,
+        params: dict[str, Any],
+        approved: bool,
+    ) -> None:
+        self._send_server_response(request_id, self._approval_response(method, params, approved))
+
+    def _send_server_response(self, request_id: str | int, result: dict[str, Any]) -> None:
+        if self.process.poll() is not None:
+            raise RuntimeError("codex app-server is not running")
+        with self._lock:
+            assert self.process.stdin is not None
+            self.process.stdin.write(
+                json.dumps({"id": request_id, "result": result}, ensure_ascii=False) + "\n"
+            )
+            self.process.stdin.flush()
+
+    def _approval_response(
+        self,
+        method: str,
+        params: dict[str, Any],
+        approved: bool,
+    ) -> dict[str, Any]:
+        if method == "item/commandExecution/requestApproval":
+            return {"decision": "accept" if approved else "decline"}
+        if method == "item/fileChange/requestApproval":
+            return {"decision": "accept" if approved else "decline"}
+        if method == "item/permissions/requestApproval":
+            return {
+                "permissions": (params.get("permissions") or {}) if approved else {},
+                "scope": "turn",
+                "strictAutoReview": True,
+            }
+        if method in {"execCommandApproval", "applyPatchApproval"}:
+            return {"decision": "approved" if approved else "denied"}
+        raise RuntimeError(f"unsupported approval request method: {method}")
 
     def _ensure_thread(self) -> str:
         if self.thread_id and self._thread_loaded:
@@ -466,12 +521,16 @@ class CodexAppServerClient:
         timeout: int,
         *,
         on_message: Callable[[str], None] | None,
+        on_approval: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         chunks: list[str] = []
         completed_text = ""
         sent_progress_item_ids: set[str] = set()
         last_plan_text = ""
         latest_diff = ""
+        pending_server_request_ids: set[str] = set()
+        reasoning_summary_buffers: dict[tuple[str, int], str] = {}
+        reasoning_summary_sent_lengths: dict[tuple[str, int], int] = {}
         idle_deadline = time.time() + timeout
         last_active_check = 0.0
         if not self._get_current_turn_id(thread_id):
@@ -479,6 +538,9 @@ class CodexAppServerClient:
         while True:
             remaining = idle_deadline - time.time()
             if remaining <= 0:
+                if pending_server_request_ids:
+                    idle_deadline = time.time() + timeout
+                    continue
                 last_active_check = time.time()
                 if self._thread_is_active(thread_id):
                     idle_deadline = last_active_check + timeout
@@ -498,7 +560,10 @@ class CodexAppServerClient:
                 continue
             method = notification.get("method")
             params = notification.get("params") or {}
-            if params.get("threadId") != thread_id:
+            params_thread_id = params.get("threadId")
+            if params_thread_id is None and method not in {"execCommandApproval", "applyPatchApproval"}:
+                continue
+            if params_thread_id is not None and params_thread_id != thread_id:
                 continue
             notification_turn_id = self._notification_turn_id(params)
             current_turn_id = self._get_current_turn_id(thread_id) or turn_id
@@ -510,8 +575,29 @@ class CodexAppServerClient:
             if notification_turn_id and notification_turn_id not in accepted_turn_ids:
                 continue
             idle_deadline = time.time() + timeout
+            if method in APPROVAL_REQUEST_METHODS:
+                request_id = notification.get("id")
+                if request_id is not None:
+                    pending_server_request_ids.add(str(request_id))
+                    if on_approval:
+                        on_approval(notification)
+                continue
+            if method == "serverRequest/resolved":
+                request_id = params.get("requestId")
+                if request_id is not None:
+                    pending_server_request_ids.discard(str(request_id))
+                continue
             if method == "item/agentMessage/delta":
                 chunks.append(params.get("delta", ""))
+            elif method == "item/reasoning/summaryTextDelta":
+                text = self._format_reasoning_summary_delta(
+                    params,
+                    reasoning_summary_buffers,
+                    reasoning_summary_sent_lengths,
+                    force=False,
+                )
+                if text and on_message:
+                    on_message(text)
             elif method == "turn/plan/updated":
                 text = format_plan_update(params)
                 if text and text != last_plan_text and on_message:
@@ -562,6 +648,12 @@ class CodexAppServerClient:
                 if turn.get("status") == "failed":
                     self._clear_current_turn_id(thread_id, current_turn_id)
                     return f"Codex turn failed: {turn.get('error')}"
+                summary_text = self._flush_reasoning_summaries(
+                    reasoning_summary_buffers,
+                    reasoning_summary_sent_lengths,
+                )
+                if summary_text and on_message:
+                    on_message(summary_text)
                 diff_summary = (
                     format_diff_summary(latest_diff)
                     if self._bridge_option("bridge_forward_file_changes", False)
@@ -571,6 +663,52 @@ class CodexAppServerClient:
                     on_message(diff_summary)
                 self._clear_current_turn_id(thread_id, current_turn_id)
                 return completed_text or "".join(chunks).strip() or "(Codex completed with no output)"
+
+    def _format_reasoning_summary_delta(
+        self,
+        params: dict[str, Any],
+        buffers: dict[tuple[str, int], str],
+        sent_lengths: dict[tuple[str, int], int],
+        *,
+        force: bool,
+    ) -> str | None:
+        if not self._bridge_option("bridge_forward_thought_summary", True):
+            return None
+        item_id = str(params.get("itemId") or "")
+        try:
+            summary_index = int(params.get("summaryIndex") or 0)
+        except (TypeError, ValueError):
+            summary_index = 0
+        key = (item_id, summary_index)
+        delta = str(params.get("delta") or "")
+        buffers[key] = buffers.get(key, "") + delta
+        current = buffers[key]
+        sent = sent_lengths.get(key, 0)
+        pending = current[sent:]
+        if not pending.strip():
+            return None
+        should_send = force or len(pending) >= 160 or pending.endswith(
+            ("\n", "。", "！", "？", ".", "!", "?")
+        )
+        if not should_send:
+            return None
+        sent_lengths[key] = len(current)
+        return "[思考摘要]\n" + tail_text(pending.strip(), 1200)
+
+    def _flush_reasoning_summaries(
+        self,
+        buffers: dict[tuple[str, int], str],
+        sent_lengths: dict[tuple[str, int], int],
+    ) -> str | None:
+        parts: list[str] = []
+        for key, current in buffers.items():
+            pending = current[sent_lengths.get(key, 0) :]
+            if pending.strip():
+                parts.append(pending.strip())
+                sent_lengths[key] = len(current)
+        if not parts:
+            return None
+        return "[思考摘要]\n" + tail_text("\n".join(parts), 1200)
 
     def _format_completed_progress(
         self,
@@ -642,7 +780,9 @@ class CodexAppServerClient:
                 print(f"codex app-server non-json stdout: {line}", flush=True)
                 continue
             request_id = message.get("id")
-            if request_id in self._responses:
+            if message.get("method"):
+                self._notifications.put(message)
+            elif request_id in self._responses:
                 self._responses[request_id].put(message)
             else:
                 self._notifications.put(message)

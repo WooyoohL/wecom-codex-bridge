@@ -47,6 +47,7 @@ class FakeRemote:
         self.unarchived: list[str] = []
         self.rolled_back: list[tuple[str, int]] = []
         self.wait_reply = "done"
+        self.approvals: list[tuple[object, str, dict[str, object], bool]] = []
         self.goal: dict[str, object] | None = None
         self.threads: list[dict[str, object]] = [
             {"id": "thread-abc123", "cwd": "/tmp/project-a", "preview": "recent work"},
@@ -65,8 +66,17 @@ class FakeRemote:
         self.interrupted.append((thread_id, turn_id))
         return turn_id
 
-    def wait_for_turn(self, thread_id: str, turn_id: str, on_message=None) -> str:
+    def wait_for_turn(self, thread_id: str, turn_id: str, on_message=None, on_approval=None) -> str:
         return self.wait_reply
+
+    def respond_to_approval_request(
+        self,
+        request_id: object,
+        method: str,
+        params: dict[str, object],
+        approved: bool,
+    ) -> None:
+        self.approvals.append((request_id, method, params, approved))
 
     def list_models(self, limit: int = 20) -> list[dict[str, object]]:
         return [
@@ -648,6 +658,191 @@ def test_wait_for_turn_suppresses_tool_noise_by_default() -> None:
     assert reply == "final"
 
 
+def test_wait_for_turn_forwards_reasoning_summary_delta() -> None:
+    client = object.__new__(CodexAppServerClient)
+    client.config = replace_config(make_worker()[0].config, bridge_forward_thought_summary=True)
+    client._notifications = queue.Queue()
+    client._turn_state_lock = threading.Lock()
+    client._current_turn_ids = {}
+    client._notifications.put(
+        {
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "reasoning-1",
+                "summaryIndex": 0,
+                "delta": "我会先确认审批协议，再实现手机端回写。",
+            },
+        }
+    )
+    client._notifications.put(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "final",
+                },
+            },
+        }
+    )
+    client._notifications.put(
+        {
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turnId": "turn-1", "turn": {"status": "completed"}},
+        }
+    )
+    progress: list[str] = []
+
+    reply = CodexAppServerClient._wait_for_turn(
+        client,
+        "thread-1",
+        "turn-1",
+        1,
+        on_message=progress.append,
+    )
+
+    assert progress == ["[思考摘要]\n我会先确认审批协议，再实现手机端回写。"]
+    assert reply == "final"
+
+
+def test_wait_for_turn_surfaces_approval_request() -> None:
+    client = object.__new__(CodexAppServerClient)
+    client.config = make_worker()[0].config
+    client._notifications = queue.Queue()
+    client._turn_state_lock = threading.Lock()
+    client._current_turn_ids = {}
+    client._notifications.put(
+        {
+            "id": "approval-1",
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "cmd-1",
+                "command": "pytest",
+                "cwd": "/tmp/project-a",
+            },
+        }
+    )
+    client._notifications.put(
+        {
+            "method": "serverRequest/resolved",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "requestId": "approval-1",
+            },
+        }
+    )
+    client._notifications.put(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "final",
+                },
+            },
+        }
+    )
+    client._notifications.put(
+        {
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turnId": "turn-1", "turn": {"status": "completed"}},
+        }
+    )
+    approvals: list[dict[str, object]] = []
+
+    reply = CodexAppServerClient._wait_for_turn(
+        client,
+        "thread-1",
+        "turn-1",
+        1,
+        on_message=None,
+        on_approval=approvals.append,
+    )
+
+    assert reply == "final"
+    assert len(approvals) == 1
+    assert approvals[0]["id"] == "approval-1"
+
+
+def test_codex_approval_reply_uses_plain_agree_or_reject() -> None:
+    worker, sender, remote = make_worker()
+    worker._send_codex_approval_request(
+        {
+            "id": "approval-1",
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "cmd-1",
+                "command": "pytest",
+                "cwd": "/tmp/project-a",
+            },
+        },
+        "me",
+    )
+
+    assert_contains(sender.sent[-1][1], "[审批请求]")
+    assert_contains(sender.sent[-1][1], "回复 同意")
+    reply = worker._handle_codex_approval_reply("同意", "me")
+
+    assert reply == "已同意 Codex 审批\nid=1"
+    assert remote.approvals == [
+        (
+            "approval-1",
+            "item/commandExecution/requestApproval",
+            {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "cmd-1",
+                "command": "pytest",
+                "cwd": "/tmp/project-a",
+            },
+            True,
+        )
+    ]
+
+
+def test_approval_response_shapes() -> None:
+    client = object.__new__(CodexAppServerClient)
+
+    assert CodexAppServerClient._approval_response(
+        client,
+        "item/commandExecution/requestApproval",
+        {},
+        True,
+    ) == {"decision": "accept"}
+    assert CodexAppServerClient._approval_response(
+        client,
+        "item/fileChange/requestApproval",
+        {},
+        False,
+    ) == {"decision": "decline"}
+    permissions = {"network": {"enabled": True}, "fileSystem": None}
+    assert CodexAppServerClient._approval_response(
+        client,
+        "item/permissions/requestApproval",
+        {"permissions": permissions},
+        True,
+    ) == {"permissions": permissions, "scope": "turn", "strictAutoReview": True}
+    assert CodexAppServerClient._approval_response(
+        client,
+        "execCommandApproval",
+        {},
+        False,
+    ) == {"decision": "denied"}
+
+
 def test_wait_for_turn_renews_timeout_while_thread_active() -> None:
     client = object.__new__(CodexAppServerClient)
     client._notifications = queue.Queue()
@@ -823,6 +1018,10 @@ def main() -> None:
         test_split_message_keeps_menu_lines_together,
         test_wait_for_turn_forwards_commentary_summary,
         test_wait_for_turn_suppresses_tool_noise_by_default,
+        test_wait_for_turn_forwards_reasoning_summary_delta,
+        test_wait_for_turn_surfaces_approval_request,
+        test_codex_approval_reply_uses_plain_agree_or_reject,
+        test_approval_response_shapes,
         test_wait_for_turn_renews_timeout_while_thread_active,
         test_interrupt_retries_with_actual_active_turn_id,
         test_wait_for_turn_follows_steered_turn_id,

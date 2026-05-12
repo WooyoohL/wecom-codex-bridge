@@ -4,6 +4,7 @@ import re
 import threading
 import time
 from dataclasses import replace
+from itertools import count
 from typing import Callable
 
 from wecom_bridge.audit import audit_event
@@ -16,6 +17,7 @@ from wecom_bridge.models import (
     ActiveTurn,
     IncomingMessage,
     MenuOption,
+    PendingCodexApproval,
     PendingConfirmation,
     PendingMenu,
     RecentOutgoing,
@@ -49,6 +51,8 @@ class MessageWorker:
         self.recent_outgoing: list[RecentOutgoing] = []
         self.pending_menu: PendingMenu | None = None
         self.pending_confirmation: PendingConfirmation | None = None
+        self.pending_codex_approvals: dict[str, PendingCodexApproval] = {}
+        self._approval_ids = count(1)
         self.active_turn: ActiveTurn | None = None
         self.remote_client: CodexAppServerClient | None = None
         if config.codex_backend == "codex_remote_control":
@@ -91,6 +95,13 @@ class MessageWorker:
                         reply, after_send = bridge_result
                     else:
                         reply = bridge_result
+                elif (
+                    approval_reply := self._handle_codex_approval_reply(
+                        message.content,
+                        self.config.to_user or message.from_user,
+                    )
+                ) is not None:
+                    reply = approval_reply
                 elif (
                     pending_confirm := self._handle_pending_confirmation(
                         message.content,
@@ -221,9 +232,9 @@ class MessageWorker:
         if not confirmation:
             return None
         stripped = text.strip()
-        if stripped in {"确认", "同意", "yes", "y"}:
+        if stripped in {"确认", "yes", "y"}:
             return self._confirm_bridge_command(confirmation.confirmation_id, target)
-        if stripped in {"取消", "拒绝", "no", "n"}:
+        if stripped in {"取消", "no", "n"}:
             self._clear_pending_confirmation()
             audit_event(
                 self.config,
@@ -233,6 +244,58 @@ class MessageWorker:
             )
             return f"cancelled: {confirmation.command_line}"
         return None
+
+    def _set_pending_codex_approval(self, approval: PendingCodexApproval) -> None:
+        with self._pending_lock:
+            self.pending_codex_approvals[approval.approval_id] = approval
+
+    def _pop_pending_codex_approval(self, approval_id: str) -> PendingCodexApproval | None:
+        with self._pending_lock:
+            return self.pending_codex_approvals.pop(approval_id, None)
+
+    def _pending_codex_approvals_for_target(self, target: str) -> list[PendingCodexApproval]:
+        with self._pending_lock:
+            now = time.time()
+            expired = [
+                approval_id
+                for approval_id, approval in self.pending_codex_approvals.items()
+                if now - approval.created_at > 900
+            ]
+            for approval_id in expired:
+                self.pending_codex_approvals.pop(approval_id, None)
+            return [
+                approval
+                for approval in self.pending_codex_approvals.values()
+                if approval.target == target
+            ]
+
+    def _handle_codex_approval_reply(self, text: str, target: str) -> str | None:
+        stripped = text.strip()
+        if stripped not in {"同意", "拒绝"}:
+            return None
+        approvals = self._pending_codex_approvals_for_target(target)
+        if not approvals:
+            return None
+        approval = sorted(approvals, key=lambda item: item.created_at)[0]
+        self._pop_pending_codex_approval(approval.approval_id)
+        approved = stripped == "同意"
+        assert self.remote_client is not None
+        self.remote_client.respond_to_approval_request(
+            approval.request_id,
+            approval.method,
+            approval.params,
+            approved,
+        )
+        audit_event(
+            self.config,
+            "codex_approval_resolved",
+            user=target,
+            approval_id=approval.approval_id,
+            method=approval.method,
+            approved=approved,
+        )
+        decision = "已同意" if approved else "已拒绝"
+        return f"{decision} Codex 审批\nid={approval.approval_id}"
 
     def _handle_pending_menu(self, text: str) -> str | None:
         menu = self._pending_snapshot()
@@ -386,6 +449,10 @@ class MessageWorker:
                 active.thread_id,
                 active.turn_id,
                 on_message=lambda text: self._send_progress(text, active.target),
+                on_approval=lambda request: self._send_codex_approval_request(
+                    request,
+                    active.target,
+                ),
             )
             if self._active_thread_is_stopping(active.thread_id):
                 current = self._active_snapshot()
@@ -1070,3 +1137,82 @@ class MessageWorker:
             self._send_and_remember(cleaned, target, kind="progress")
         except Exception as exc:
             print(f"failed to send progress message: {exc}", flush=True)
+
+    def _send_codex_approval_request(self, request: dict[str, object], target: str) -> None:
+        method = str(request.get("method") or "")
+        params = request.get("params") if isinstance(request.get("params"), dict) else {}
+        assert isinstance(params, dict)
+        request_id = request.get("id")
+        if request_id is None:
+            return
+        approval_id = str(next(self._approval_ids))
+        summary = self._format_codex_approval_summary(approval_id, method, params)
+        approval = PendingCodexApproval(
+            approval_id=approval_id,
+            request_id=request_id,
+            method=method,
+            params=dict(params),
+            target=target,
+            created_at=time.time(),
+            summary=summary,
+        )
+        self._set_pending_codex_approval(approval)
+        audit_event(
+            self.config,
+            "codex_approval_requested",
+            user=target,
+            approval_id=approval_id,
+            method=method,
+            thread_id=params.get("threadId"),
+            turn_id=params.get("turnId"),
+        )
+        self._send_and_remember(summary, target, kind="approval")
+
+    def _format_codex_approval_summary(
+        self,
+        approval_id: str,
+        method: str,
+        params: dict[str, object],
+    ) -> str:
+        lines = [
+            "[审批请求]",
+            f"id={approval_id}",
+            f"type={self._approval_type_label(method)}",
+        ]
+        reason = str(params.get("reason") or "").strip()
+        cwd = str(params.get("cwd") or "").strip()
+        if cwd:
+            lines.append(f"cwd={cwd}")
+        if reason:
+            lines.append(f"reason={reason}")
+        if method in {"item/commandExecution/requestApproval", "execCommandApproval"}:
+            command = params.get("command")
+            if isinstance(command, list):
+                command_text = " ".join(str(part) for part in command)
+            else:
+                command_text = str(command or "")
+            if command_text:
+                lines.append("command=" + tail_text(command_text, 900))
+        elif method in {"item/fileChange/requestApproval", "applyPatchApproval"}:
+            grant_root = str(params.get("grantRoot") or "").strip()
+            if grant_root:
+                lines.append(f"grant_root={grant_root}")
+            files = params.get("files")
+            if isinstance(files, list) and files:
+                lines.append("files=" + ", ".join(str(path) for path in files[:8]))
+        elif method == "item/permissions/requestApproval":
+            lines.append("permissions=" + tail_text(str(params.get("permissions") or {}), 900))
+            lines.append("scope=turn")
+        lines.append("")
+        lines.append("回复 同意 继续，回复 拒绝 取消。")
+        return "\n".join(lines)
+
+    def _approval_type_label(self, method: str) -> str:
+        labels = {
+            "item/commandExecution/requestApproval": "command",
+            "execCommandApproval": "command",
+            "item/fileChange/requestApproval": "file_change",
+            "applyPatchApproval": "file_change",
+            "item/permissions/requestApproval": "permissions",
+        }
+        return labels.get(method, method)

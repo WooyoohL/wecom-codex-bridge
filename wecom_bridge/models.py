@@ -1,5 +1,6 @@
 import time
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,17 @@ class PendingConfirmation:
     command_line: str
     user_id: str
     created_at: float
+
+
+@dataclass(frozen=True)
+class PendingCodexApproval:
+    approval_id: str
+    request_id: str | int
+    method: str
+    params: dict[str, Any]
+    target: str
+    created_at: float
+    summary: str
 
 
 def format_active_turn_status(active: ActiveTurn | None) -> str:
